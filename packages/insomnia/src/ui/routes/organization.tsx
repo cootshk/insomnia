@@ -1,4 +1,4 @@
-import React, { Fragment, useEffect, useState } from 'react';
+import React, { Fragment, useEffect, useMemo, useState } from 'react';
 import {
   Button,
   Link,
@@ -19,6 +19,7 @@ import {
   redirect,
   useFetcher,
   useLoaderData,
+  useLocation,
   useNavigate,
   useParams,
   useRouteLoaderData,
@@ -37,6 +38,7 @@ import { VCSInstance } from '../../sync/vcs/insomnia-sync';
 import { migrateProjectsIntoOrganization, shouldMigrateProjectUnderOrganization } from '../../sync/vcs/migrate-projects-into-organization';
 import { insomniaFetch } from '../../ui/insomniaFetch';
 import { invariant } from '../../utils/invariant';
+import { AsyncTask } from '../../utils/router';
 import { SegmentEvent } from '../analytics';
 import { getLoginUrl } from '../auth-session-provider';
 import { Avatar } from '../components/avatar';
@@ -53,7 +55,6 @@ import { PresentUsers } from '../components/present-users';
 import { Toast } from '../components/toast';
 import { useAIContext } from '../context/app/ai-context';
 import { InsomniaEventStreamProvider } from '../context/app/insomnia-event-stream-context';
-import { syncProjects } from './project';
 import { useRootLoaderData } from './root';
 import { UntrackedProjectsLoaderData } from './untracked-projects';
 import { WorkspaceLoaderData } from './workspace';
@@ -165,43 +166,6 @@ async function syncOrganizations(sessionId: string, accountId: string) {
   }
 }
 
-interface SyncOrgsAndProjectsActionRequest {
-  sessionId: string;
-  accountId: string;
-  personalOrganizationId?: string;
-  organizationId: string;
-}
-
-// this action is used to run task that we dont want to block the UI
-export const syncOrgsAndProjectsAction: ActionFunction = async ({ request }) => {
-  try {
-    const { organizationId } = await request.json() as SyncOrgsAndProjectsActionRequest;
-    const { id: sessionId, accountId } = await userSession.getOrCreate();
-
-    invariant(sessionId, 'sessionId is required');
-    invariant(accountId, 'accountId is required');
-    const taskPromiseList = [];
-    taskPromiseList.push(syncOrganizations(sessionId, accountId));
-    const organizations = JSON.parse(localStorage.getItem(`${accountId}:organizations`) || '[]') as Organization[];
-    invariant(organizations, 'Failed to fetch organizations.');
-    const personalOrganization = findPersonalOrganization(organizations, accountId);
-    invariant(personalOrganization, 'personalOrganization is required');
-    invariant(personalOrganization.id, 'personalOrganizationId is required');
-    taskPromiseList.push(migrateProjectsUnderOrganization(personalOrganization.id, sessionId));
-    invariant(organizationId, 'organizationId is required');
-    taskPromiseList.push(syncProjects(organizationId));
-
-    await Promise.all(taskPromiseList);
-
-    return {};
-  } catch (error) {
-    console.log('Failed to run async task', error);
-    return {
-      error: error.message,
-    };
-  }
-};
-
 async function migrateProjectsUnderOrganization(personalOrganizationId: string, sessionId: string) {
   if (await shouldMigrateProjectUnderOrganization()) {
     await migrateProjectsIntoOrganization({
@@ -263,6 +227,25 @@ export const syncOrganizationsAction: ActionFunction = async () => {
   }
 
   return null;
+};
+
+export const migrateProjectsUnderOrganizationAction: ActionFunction = async () => {
+  try {
+    const { id: sessionId, accountId } = await userSession.getOrCreate();
+    invariant(sessionId, 'sessionId is required');
+    invariant(accountId, 'accountId is required');
+    const organizations = JSON.parse(localStorage.getItem(`${accountId}:organizations`) || '[]') as Organization[];
+    const personalOrganization = findPersonalOrganization(organizations, accountId);
+    invariant(personalOrganization, 'organizationId is required');
+
+    await migrateProjectsUnderOrganization(personalOrganization?.id, sessionId);
+
+    return null;
+  } catch (error) {
+    return {
+      error: error.message,
+    };
+  }
 };
 
 export interface OrganizationLoaderData {
@@ -441,31 +424,55 @@ const OrganizationRoute = () => {
     workspaceId?: string;
   };
   const [status, setStatus] = useState<'online' | 'offline'>('online');
-  const syncOrgsAndProjects = useFetcher();
-  // TODO: This could run more than once
-  // controlling useEffect execution
-  // use fetcher history state to avoid running the same task multiple times
+
   // ideas:
   // 1. useEffect with controlled execution
   // 2. use fetcher history state to avoid running the same task multiple times
   // 3. create an event after logged in user is detected in initial entry and listen.once in this component
 
-  // other note:
-  // submit existing actions rather than this new action
+  const location = useLocation();
+  const asyncTaskList = useMemo(() => {
+    return location?.state?.asyncTaskList || [] as AsyncTask[];
+  }, [location?.state?.asyncTaskList]);
+  const syncOrgsFetcher = useFetcher();
+  const syncProjectsFetcher = useFetcher();
+  const migrateProjectsFetcher = useFetcher();
 
   useEffect(() => {
-    console.log('run async task in useEffect');
-    const isIdleAndUninitialized = syncOrgsAndProjects.state === 'idle' && !syncOrgsAndProjects.data;
-    if (isIdleAndUninitialized) {
-      syncOrgsAndProjects.submit({
-        organizationId,
-      }, {
-        action: '/organization/syncOrgsAndProjectsAction',
+    // sync organizations
+    if (asyncTaskList.includes(AsyncTask.SyncOrganization)) {
+      console.log('running sync organization task');
+      const submit = syncOrgsFetcher.submit;
+      submit({}, {
+        action: '/organization/sync',
         method: 'POST',
-        encType: 'application/json',
       });
     }
-  }, [userSession.id, organizationId, userSession.accountId, syncOrgsAndProjects]);
+  }, [asyncTaskList, syncOrgsFetcher.submit]);
+
+  useEffect(() => {
+    // sync projects under organization
+    if (asyncTaskList.includes(AsyncTask.SyncProjects)) {
+      console.log('running sync projects task');
+      const submit = syncProjectsFetcher.submit;
+      submit({}, {
+        action: `/organization/${organizationId}/sync-projects`,
+        method: 'POST',
+      });
+    }
+  }, [asyncTaskList, organizationId, syncProjectsFetcher.submit]);
+
+  useEffect(() => {
+    // migrate projects under personal organization
+    if (asyncTaskList.includes(AsyncTask.MigrateProjects)) {
+      console.log('running migrate projects task');
+      const submit = migrateProjectsFetcher.submit;
+      submit({}, {
+        action: '/organization/migrate-projects',
+        method: 'POST',
+      });
+    }
+  }, [asyncTaskList, migrateProjectsFetcher.submit]);
 
   useEffect(() => {
     const isIdleAndUninitialized = untrackedProjectsFetcher.state === 'idle' && !untrackedProjectsFetcher.data;
